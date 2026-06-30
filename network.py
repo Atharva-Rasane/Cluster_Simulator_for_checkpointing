@@ -25,15 +25,15 @@ from distributed_training import NODE_FAILURE_EXIT_CODE, PROCESS_FAILURE_EXIT_CO
 
 # Every worker is reachable from every other worker through the shared switch.
 NUMBER_OF_NODES = 4
-TARGET_ITERATIONS = 5
+TARGET_ITERATIONS = 1
 
 WORKER_VARIANTS_TO_RUN = [
-    # "nocheckpointing",
+    "nocheckpointing",
     "checkpointing",
 ]
 
 WORKER_SCRIPTS = {
-    # "nocheckpointing": "worker-nocheckpointing.py",
+    "nocheckpointing": "worker-nocheckpointing.py",
     "checkpointing": "worker-checkpointing.py",
 }
 
