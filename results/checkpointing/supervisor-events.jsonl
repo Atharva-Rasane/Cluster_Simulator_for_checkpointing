@@ -1,0 +1,4 @@
+{"type":"supervisor_restart","failure_type":"process","failed_host":"h2","failed_rank":1,"failure_iteration":0,"failure_stage":"unknown/peer-induced","restart_delay_s":2.0024258580001515,"wall_time_utc":"2026-06-29T21:56:59.240767+00:00"}
+{"type":"supervisor_restart","failure_type":"process","failed_host":"h2","failed_rank":1,"failure_iteration":0,"failure_stage":"unknown/peer-induced","restart_delay_s":2.0022446650000347,"wall_time_utc":"2026-06-29T21:57:42.838196+00:00"}
+{"type":"supervisor_restart","failure_type":"process","failed_host":"h2","failed_rank":1,"failure_iteration":1,"failure_stage":"training/gradient-sync","restart_delay_s":2.002329594999992,"wall_time_utc":"2026-06-29T21:58:08.455886+00:00"}
+{"type":"supervisor_restart","failure_type":"process","failed_host":"h3","failed_rank":2,"failure_iteration":1,"failure_stage":"training/gradient-sync","restart_delay_s":2.002452152999922,"wall_time_utc":"2026-06-29T21:58:39.657505+00:00"}

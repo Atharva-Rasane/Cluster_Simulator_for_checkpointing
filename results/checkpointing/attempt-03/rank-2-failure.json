@@ -1,0 +1,17 @@
+{
+  "type": "worker_failure",
+  "experiment": "20260629T215617Z-checkpointing",
+  "variant": "checkpointing",
+  "attempt": 3,
+  "host": "h3",
+  "rank": 2,
+  "failure_type": "process",
+  "exit_code": 20,
+  "iteration": 1,
+  "stage": "training/gradient-sync",
+  "last_completed_iteration": 0,
+  "resume_checkpoint_iteration": 0,
+  "worker_elapsed_s": 28.92601770100009,
+  "message": "simulated process failure at iter=1, stage=training/gradient-sync",
+  "wall_time_utc": "2026-06-29T21:58:37.421701+00:00"
+}
