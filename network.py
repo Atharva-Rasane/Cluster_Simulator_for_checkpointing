@@ -71,20 +71,24 @@ GRADIENT_SIZE_MB = 14*1024
 
 CHECKPOINT_INTERVAL = 1
 
-# Logical checkpoint size for the timing model: 16.2 GB.
+# Logical checkpoint shard size per worker for the timing model: 96 GB.
 CHECKPOINT_SIZE_MB = 96 * 1024
 
-# The object-store host receives actual bytes. Sending a full 16.2 GB on every
-# checkpoint is inconvenient for a laptop simulation, so the wire payload is
-# scaled while the timing/resource model continues to use the logical size.
+# The object-store host receives actual bytes. Sending every full shard is
+# inconvenient for a laptop simulation, so each wire payload is scaled while
+# the timing/resource model continues to use the logical shard size.
 # Set this to 1.0 to send the complete checkpoint size.
 CHECKPOINT_WIRE_SCALE = 0.001
 
 DRAM_CAPACITY_MB = 512 * 1024
 GPU_TO_DRAM_BANDWIDTH_MB_S = 12_000.0
 
-# Kept for future local-SSD worker variants. The current checkpoint worker does
-# not use SSD; it sends GPU -> DRAM -> external object store.
+# Each additional checkpointing rank adds this percentage to simulated
+# GPU->DRAM copy time and object-store persistence service time.
+CHECKPOINT_SLOWDOWN_PERCENT_PER_EXTRA_RANK = 10.0
+
+# Kept for future local-SSD worker variants. The checkpoint worker sends every
+# rank's shard through GPU -> DRAM -> external object store.
 SSD_CAPACITY_MB = 4 * 1024 * 1024
 SSD_BANDWIDTH_MB_S = 3_500.0
 
@@ -95,10 +99,20 @@ OBJECT_STORE_READ_BANDWIDTH_MB_S = 6_000.0
 # Failure injection and recovery
 # ---------------------------------------------------------------------
 
+# "chance": use the per-second hazards below.
+# "iteration": fail once according to the deterministic iteration schedule.
+FAILURE_MODE = "chance"
+
 # Hazard percentages checked throughout compute, communication, checkpoint,
 # and recovery work. Values are percentages per second, not per iteration.
 PROCESS_FAILURE_PERCENT_PER_SECOND = 0.09
 NODE_FAILURE_PERCENT_PER_SECOND = 0.01
+
+# Set either interval to 0 to disable that deterministic failure type.
+PROCESS_FAILURE_EVERY_N_ITERATIONS = 3
+NODE_FAILURE_EVERY_N_ITERATIONS = 5
+DETERMINISTIC_PROCESS_FAILURE_RANK = 0
+DETERMINISTIC_NODE_FAILURE_RANK = 1
 
 PROCESS_RESTART_TIME_SECONDS = 2.0
 NODE_RESTART_TIME_SECONDS = 15.0
@@ -125,6 +139,30 @@ def validate_configuration() -> None:
         raise ValueError("CHECKPOINT_WIRE_SCALE must be in (0, 1]")
     if CHECKPOINT_SIZE_MB > DRAM_CAPACITY_MB:
         raise ValueError("Checkpoint does not fit in DRAM staging capacity")
+    if CHECKPOINT_SLOWDOWN_PERCENT_PER_EXTRA_RANK < 0:
+        raise ValueError(
+            "CHECKPOINT_SLOWDOWN_PERCENT_PER_EXTRA_RANK cannot be negative"
+        )
+    if FAILURE_MODE not in {"chance", "probabilistic", "iteration"}:
+        raise ValueError(
+            "FAILURE_MODE must be 'chance' or 'iteration'"
+        )
+    for name, interval in {
+        "PROCESS_FAILURE_EVERY_N_ITERATIONS": (
+            PROCESS_FAILURE_EVERY_N_ITERATIONS
+        ),
+        "NODE_FAILURE_EVERY_N_ITERATIONS": NODE_FAILURE_EVERY_N_ITERATIONS,
+    }.items():
+        if interval < 0:
+            raise ValueError(f"{name} cannot be negative")
+    for name, rank in {
+        "DETERMINISTIC_PROCESS_FAILURE_RANK": (
+            DETERMINISTIC_PROCESS_FAILURE_RANK
+        ),
+        "DETERMINISTIC_NODE_FAILURE_RANK": DETERMINISTIC_NODE_FAILURE_RANK,
+    }.items():
+        if not 0 <= rank < NUMBER_OF_NODES:
+            raise ValueError(f"{name} must identify an existing rank")
     unknown = set(WORKER_VARIANTS_TO_RUN) - set(WORKER_SCRIPTS)
     if unknown:
         raise ValueError(f"Unknown worker variants: {sorted(unknown)}")
@@ -160,13 +198,30 @@ def print_configuration_summary() -> None:
     print(f"Link delay:                         {LINK_DELAY_MS} ms")
     print(f"Actual gradient payload/rank:       {GRADIENT_SIZE_MB:.2f} MB/iteration")
     print(f"Checkpoint interval:                every {CHECKPOINT_INTERVAL} iteration(s)")
-    print(f"Logical checkpoint size:            {CHECKPOINT_SIZE_MB / 1024:.2f} GB")
-    print(f"Actual checkpoint wire payload:     {checkpoint_wire_mb:.2f} MB")
+    print(f"Logical checkpoint shard/node:      {CHECKPOINT_SIZE_MB / 1024:.2f} GB")
+    print(f"Actual wire payload/node:           {checkpoint_wire_mb:.2f} MB")
     print(f"GPU->DRAM checkpoint time:          {gpu_to_dram_s:.3f}s")
+    print(
+        "Checkpoint slowdown/extra rank:   "
+        f"{CHECKPOINT_SLOWDOWN_PERCENT_PER_EXTRA_RANK:.2f}%"
+    )
     print(f"Object-store persist time:          {object_write_s:.3f}s")
     print(f"Object-store recovery read time:    {object_read_s:.3f}s")
-    print(f"Process failure hazard:             {PROCESS_FAILURE_PERCENT_PER_SECOND:.4f}%/s")
-    print(f"Node failure hazard:                {NODE_FAILURE_PERCENT_PER_SECOND:.4f}%/s")
+    print(f"Failure mode:                       {FAILURE_MODE}")
+    if FAILURE_MODE in {"chance", "probabilistic"}:
+        print(f"Process failure hazard:             {PROCESS_FAILURE_PERCENT_PER_SECOND:.4f}%/s")
+        print(f"Node failure hazard:                {NODE_FAILURE_PERCENT_PER_SECOND:.4f}%/s")
+    else:
+        print(
+            "Process failure schedule:           every "
+            f"{PROCESS_FAILURE_EVERY_N_ITERATIONS} iteration(s), "
+            f"rank {DETERMINISTIC_PROCESS_FAILURE_RANK}"
+        )
+        print(
+            "Node failure schedule:              every "
+            f"{NODE_FAILURE_EVERY_N_ITERATIONS} iteration(s), "
+            f"rank {DETERMINISTIC_NODE_FAILURE_RANK}"
+        )
     print(f"Process restart delay:              {PROCESS_RESTART_TIME_SECONDS:.3f}s")
     print(f"Node restart delay:                 {NODE_RESTART_TIME_SECONDS:.3f}s")
     print("=" * 96 + "\n", flush=True)
@@ -257,6 +312,8 @@ def create_worker_command(
         str(DRAM_CAPACITY_MB),
         "--gpu-to-dram-bandwidth-mb-s",
         str(GPU_TO_DRAM_BANDWIDTH_MB_S),
+        "--checkpoint-slowdown-percent-per-extra-rank",
+        str(CHECKPOINT_SLOWDOWN_PERCENT_PER_EXTRA_RANK),
         "--ssd-capacity-mb",
         str(SSD_CAPACITY_MB),
         "--ssd-bandwidth-mb-s",
@@ -265,6 +322,16 @@ def create_worker_command(
         str(PROCESS_FAILURE_PERCENT_PER_SECOND),
         "--node-failure-percent-per-second",
         str(NODE_FAILURE_PERCENT_PER_SECOND),
+        "--failure-mode",
+        FAILURE_MODE,
+        "--process-failure-every-n-iterations",
+        str(PROCESS_FAILURE_EVERY_N_ITERATIONS),
+        "--node-failure-every-n-iterations",
+        str(NODE_FAILURE_EVERY_N_ITERATIONS),
+        "--deterministic-process-failure-rank",
+        str(DETERMINISTIC_PROCESS_FAILURE_RANK),
+        "--deterministic-node-failure-rank",
+        str(DETERMINISTIC_NODE_FAILURE_RANK),
         "--random-seed",
         str(RANDOM_SEED),
     ]
@@ -556,6 +623,9 @@ def aggregate_variant(
         if event.get("experiment") == experiment
     ]
     puts = [event for event in store_events if event.get("type") == "checkpoint_put"]
+    committed_puts = [
+        event for event in puts if event.get("globally_committed") is True
+    ]
     gets = [event for event in store_events if event.get("type") == "recovery_get"]
     misses = [event for event in store_events if event.get("type") == "recovery_get_miss"]
 
@@ -577,7 +647,7 @@ def aggregate_variant(
         )
 
     latest_checkpoint_iteration = max(
-        (int(event["iteration"]) for event in puts), default=0
+        (int(event["iteration"]) for event in committed_puts), default=0
     )
     process_failures = sum(
         1 for failure in failures if failure.get("failure_type") == "process"
@@ -601,6 +671,7 @@ def aggregate_variant(
         "node_failures": node_failures,
         "restart_delay_s": total_restart_delay_s,
         "checkpoint_puts": len(puts),
+        "completed_checkpoints": len(committed_puts),
         "latest_checkpoint_iteration": latest_checkpoint_iteration,
         "recovery_get_hits": len(gets),
         "recovery_get_misses": len(misses),
@@ -650,6 +721,7 @@ def write_combined_summary(results_root: Path, summaries: list[dict[str, Any]]) 
         "node_failures",
         "restart_delay_s",
         "checkpoint_puts",
+        "completed_checkpoints",
         "latest_checkpoint_iteration",
         "recovery_get_hits",
         "recovery_get_misses",
@@ -708,6 +780,7 @@ def print_result_tables(summaries: list[dict[str, Any]]) -> None:
             [
                 summary["variant"],
                 summary["checkpoint_puts"],
+                summary["completed_checkpoints"],
                 summary["recovery_get_hits"],
                 summary["recovery_get_misses"],
                 f"{summary['object_store_checkpoint_logical_gb']:.2f}",
@@ -719,6 +792,7 @@ def print_result_tables(summaries: list[dict[str, Any]]) -> None:
         [
             "variant",
             "puts",
+            "complete",
             "get_hits",
             "get_misses",
             "logical_put_GB",
@@ -810,6 +884,8 @@ def main() -> None:
                     str(OBJECT_STORE_WRITE_BANDWIDTH_MB_S),
                     "--read-bandwidth-mb-s",
                     str(OBJECT_STORE_READ_BANDWIDTH_MB_S),
+                    "--write-contention-overhead-percent",
+                    str(CHECKPOINT_SLOWDOWN_PERCENT_PER_EXTRA_RANK),
                     "--event-file",
                     str(event_file),
                     "--ready-file",

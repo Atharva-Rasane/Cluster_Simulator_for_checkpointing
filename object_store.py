@@ -87,6 +87,8 @@ class BandwidthDelay:
     service_s: float
     expected_total_s: float
     actual_total_s: float
+    concurrent_requests: int
+    slowdown_multiplier: float
 
 
 class AggregateBandwidthResource:
@@ -98,12 +100,24 @@ class AggregateBandwidthResource:
     bandwidth.
     """
 
-    def __init__(self, bandwidth_mb_s: float) -> None:
+    def __init__(
+        self,
+        bandwidth_mb_s: float,
+        contention_overhead_percent_per_extra_request: float = 0.0,
+    ) -> None:
         if bandwidth_mb_s <= 0:
             raise ValueError("bandwidth_mb_s must be positive")
+        if contention_overhead_percent_per_extra_request < 0:
+            raise ValueError(
+                "contention overhead percentage cannot be negative"
+            )
 
         self.bandwidth_bytes_s = bandwidth_mb_s * MIB
+        self.contention_overhead_per_extra_request = (
+            contention_overhead_percent_per_extra_request / 100.0
+        )
         self._next_available = time.perf_counter()
+        self._active_requests = 0
         self._lock = threading.Lock()
 
     def consume(self, byte_count: int) -> BandwidthDelay:
@@ -111,9 +125,17 @@ class AggregateBandwidthResource:
             raise ValueError("byte_count cannot be negative")
 
         requested_at = time.perf_counter()
-        service_s = byte_count / self.bandwidth_bytes_s
 
         with self._lock:
+            self._active_requests += 1
+            concurrent_requests = self._active_requests
+            slowdown_multiplier = 1.0 + (
+                max(0, concurrent_requests - 1)
+                * self.contention_overhead_per_extra_request
+            )
+            service_s = (
+                byte_count / self.bandwidth_bytes_s
+            ) * slowdown_multiplier
             service_start = max(requested_at, self._next_available)
             service_end = service_start + service_s
             self._next_available = service_end
@@ -121,15 +143,20 @@ class AggregateBandwidthResource:
         queue_wait_s = max(0.0, service_start - requested_at)
         expected_total_s = max(0.0, service_end - requested_at)
 
-        time.sleep(expected_total_s)
-
-        actual_total_s = time.perf_counter() - requested_at
+        try:
+            time.sleep(expected_total_s)
+            actual_total_s = time.perf_counter() - requested_at
+        finally:
+            with self._lock:
+                self._active_requests -= 1
 
         return BandwidthDelay(
             queue_wait_s=queue_wait_s,
             service_s=service_s,
             expected_total_s=expected_total_s,
             actual_total_s=actual_total_s,
+            concurrent_requests=concurrent_requests,
+            slowdown_multiplier=slowdown_multiplier,
         )
 
 
@@ -190,6 +217,7 @@ class ObjectStoreServer:
         write_bandwidth_mb_s: float,
         read_bandwidth_mb_s: float,
         event_file: Path,
+        write_contention_overhead_percent: float = 0.0,
         socket_timeout_s: float = 300.0,
         max_workers: int = 128,
         max_pending_connections: int = 256,
@@ -213,17 +241,27 @@ class ObjectStoreServer:
             raise ValueError(
                 "max_checkpoint_wire_bytes must be positive"
             )
+        if write_contention_overhead_percent < 0:
+            raise ValueError(
+                "write_contention_overhead_percent cannot be negative"
+            )
 
         self.host = host
         self.port = port
         self.write_bandwidth_mb_s = write_bandwidth_mb_s
         self.read_bandwidth_mb_s = read_bandwidth_mb_s
+        self.write_contention_overhead_percent = (
+            write_contention_overhead_percent
+        )
         self.event_file = event_file
         self.socket_timeout_s = socket_timeout_s
         self.max_checkpoint_wire_bytes = max_checkpoint_wire_bytes
 
         self._write_resource = AggregateBandwidthResource(
-            write_bandwidth_mb_s
+            write_bandwidth_mb_s,
+            contention_overhead_percent_per_extra_request=(
+                write_contention_overhead_percent
+            ),
         )
         self._read_resource = AggregateBandwidthResource(
             read_bandwidth_mb_s
@@ -555,6 +593,9 @@ class ObjectStoreServer:
                 f"{persist_delay.queue_wait_s:.3f}, "
                 f"persist_service_s="
                 f"{persist_delay.service_s:.3f}, "
+                f"concurrent_writers="
+                f"{persist_delay.concurrent_requests}, "
+                f"slowdown={persist_delay.slowdown_multiplier:.3f}x, "
                 f"total_s={total_s:.3f}"
             ),
         )
@@ -583,6 +624,12 @@ class ObjectStoreServer:
                 ),
                 "object_persist_actual_total_s": (
                     persist_delay.actual_total_s
+                ),
+                "concurrent_writers": (
+                    persist_delay.concurrent_requests
+                ),
+                "contention_slowdown_multiplier": (
+                    persist_delay.slowdown_multiplier
                 ),
                 "total_s": total_s,
                 "globally_committed": (
@@ -616,6 +663,12 @@ class ObjectStoreServer:
                 ),
                 "object_persist_actual_total_s": (
                     persist_delay.actual_total_s
+                ),
+                "concurrent_writers": (
+                    persist_delay.concurrent_requests
+                ),
+                "contention_slowdown_multiplier": (
+                    persist_delay.slowdown_multiplier
                 ),
                 "total_s": total_s,
                 "committed": state["globally_committed"],
@@ -1630,6 +1683,16 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--write-contention-overhead-percent",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional persistence service time percentage "
+            "for each concurrent writer beyond the first."
+        ),
+    )
+
+    parser.add_argument(
         "--event-file",
         type=Path,
         required=True,
@@ -1688,6 +1751,11 @@ def parse_arguments() -> argparse.Namespace:
             "socket-timeout-s must be positive"
         )
 
+    if args.write_contention_overhead_percent < 0:
+        parser.error(
+            "write-contention-overhead-percent cannot be negative"
+        )
+
     if args.max_workers < 1:
         parser.error(
             "max-workers must be at least 1"
@@ -1719,6 +1787,9 @@ def main() -> None:
             args.read_bandwidth_mb_s
         ),
         event_file=args.event_file,
+        write_contention_overhead_percent=(
+            args.write_contention_overhead_percent
+        ),
         socket_timeout_s=args.socket_timeout_s,
         max_workers=args.max_workers,
         max_pending_connections=(

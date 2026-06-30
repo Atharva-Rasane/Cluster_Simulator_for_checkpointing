@@ -21,7 +21,7 @@ class CheckpointWorker:
             None,
             "WORKER",
             "START",
-            "rank-0 synchronous checkpointing to external object store",
+            "parallel per-rank checkpointing to external object store",
         )
 
         checkpoint_iteration = self.training.recover_from_object_store()
@@ -31,17 +31,10 @@ class CheckpointWorker:
             self.training.begin_iteration(iteration, self.args.target_iterations)
             self.training.training_stage(iteration)
             self.training.update_stage(iteration)
-            
+
             checkpoint_due = iteration % self.args.checkpoint_interval == 0
-            if self.args.rank == 0 and checkpoint_due:
+            if checkpoint_due:
                 self.training.checkpoint_to_object_store(iteration)
-            elif self.args.rank != 0:
-                self.training.log(
-                    iteration,
-                    "CHECKPOINT",
-                    "SKIP",
-                    "only rank 0 checkpoints",
-                )
             else:
                 self.training.log(
                     iteration,

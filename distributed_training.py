@@ -92,8 +92,14 @@ class DistributedTraining:
         gpu_to_dram_bandwidth_mb_s: float,
         ssd_capacity_mb: float,
         ssd_bandwidth_mb_s: float,
+        checkpoint_slowdown_percent_per_extra_rank: float,
+        failure_mode: str,
         process_failure_percent_per_second: float,
         node_failure_percent_per_second: float,
+        process_failure_every_n_iterations: int,
+        node_failure_every_n_iterations: int,
+        deterministic_process_failure_rank: int,
+        deterministic_node_failure_rank: int,
         random_seed: int,
         failure_event_file: Path,
         timeline_event_file: Path,
@@ -132,13 +138,27 @@ class DistributedTraining:
         self.gpu_to_dram_bandwidth_mb_s = gpu_to_dram_bandwidth_mb_s
         self.ssd_capacity_mb = ssd_capacity_mb
         self.ssd_bandwidth_mb_s = ssd_bandwidth_mb_s
+        self.checkpoint_slowdown_percent_per_extra_rank = (
+            checkpoint_slowdown_percent_per_extra_rank
+        )
 
+        self.failure_mode = failure_mode
         self.process_failure_rate = process_failure_percent_per_second / 100.0
         self.node_failure_rate = node_failure_percent_per_second / 100.0
+        self.process_failure_every_n_iterations = (
+            process_failure_every_n_iterations
+        )
+        self.node_failure_every_n_iterations = node_failure_every_n_iterations
+        self.deterministic_process_failure_rank = (
+            deterministic_process_failure_rank
+        )
+        self.deterministic_node_failure_rank = deterministic_node_failure_rank
         self.random = random.Random(random_seed + attempt * 1_000_003 + rank * 10_007)
         self.failure_event_file = failure_event_file
         self.timeline_event_file = timeline_event_file
         self.verbose_console_log = verbose_console_log
+        # Stable across retries so a new attempt can recover an earlier attempt.
+        self.object_store_run_id = f"{self.experiment}|{self.variant}"
 
         self.collective_timeout_s = collective_timeout_s
         self.ring_port = (
@@ -220,6 +240,38 @@ class DistributedTraining:
             raise ValueError("rank 0 ring_port must differ from master_port")
         if not 0 < self.checkpoint_wire_scale <= 1:
             raise ValueError("checkpoint_wire_scale must be in (0, 1]")
+        if self.checkpoint_slowdown_percent_per_extra_rank < 0:
+            raise ValueError(
+                "checkpoint_slowdown_percent_per_extra_rank cannot be negative"
+            )
+        if self.failure_mode not in {
+            "chance",
+            "probabilistic",
+            "iteration",
+        }:
+            raise ValueError(
+                "failure_mode must be 'chance' or 'iteration'"
+            )
+        for key, value in {
+            "process_failure_every_n_iterations": (
+                self.process_failure_every_n_iterations
+            ),
+            "node_failure_every_n_iterations": (
+                self.node_failure_every_n_iterations
+            ),
+        }.items():
+            if value < 0:
+                raise ValueError(f"{key} cannot be negative")
+        for key, value in {
+            "deterministic_process_failure_rank": (
+                self.deterministic_process_failure_rank
+            ),
+            "deterministic_node_failure_rank": (
+                self.deterministic_node_failure_rank
+            ),
+        }.items():
+            if not 0 <= value < self.world_size:
+                raise ValueError(f"{key} must identify an existing rank")
 
         positive = {
             "network_bandwidth_mbps": self.network_bandwidth_mbps,
@@ -326,8 +378,15 @@ class DistributedTraining:
                 f"checkpoint_logical_mb={self.checkpoint_size_mb:.2f}, "
                 f"checkpoint_wire_mb={self.checkpoint_wire_bytes / 1024 / 1024:.2f}, "
                 f"checkpoint_interval={checkpoint_interval}, "
+                f"checkpoint_slowdown_pct_extra_rank="
+                f"{self.checkpoint_slowdown_percent_per_extra_rank:.2f}, "
+                f"failure_mode={self.failure_mode}, "
                 f"process_failure_pct_s={self.process_failure_rate * 100:.4f}, "
-                f"node_failure_pct_s={self.node_failure_rate * 100:.4f}"
+                f"node_failure_pct_s={self.node_failure_rate * 100:.4f}, "
+                f"process_failure_every_iterations="
+                f"{self.process_failure_every_n_iterations}, "
+                f"node_failure_every_iterations="
+                f"{self.node_failure_every_n_iterations}"
             ),
         )
 
@@ -363,7 +422,69 @@ class DistributedTraining:
             return 0.0
         return 1.0 - math.pow(1.0 - rate_per_second, elapsed_s)
 
+    def _scheduled_failure(
+        self,
+        iteration: int,
+    ) -> tuple[str, int] | None:
+        """
+        Return the deterministic failure due on this attempt.
+
+        The global schedule is ordered by iteration (node before process when
+        both are due). Attempt numbers consume schedule entries, which prevents
+        the same iteration from failing forever after a restart.
+        """
+        if iteration < 1:
+            return None
+
+        ordinal = 0
+        for scheduled_iteration in range(1, iteration + 1):
+            scheduled: list[tuple[str, int]] = []
+            if (
+                self.node_failure_every_n_iterations > 0
+                and scheduled_iteration
+                % self.node_failure_every_n_iterations
+                == 0
+            ):
+                scheduled.append(
+                    ("node", self.deterministic_node_failure_rank)
+                )
+            if (
+                self.process_failure_every_n_iterations > 0
+                and scheduled_iteration
+                % self.process_failure_every_n_iterations
+                == 0
+            ):
+                scheduled.append(
+                    ("process", self.deterministic_process_failure_rank)
+                )
+
+            for failure_type, target_rank in scheduled:
+                if (
+                    scheduled_iteration == iteration
+                    and self.attempt == ordinal
+                    and self.rank == target_rank
+                ):
+                    return failure_type, target_rank
+                ordinal += 1
+        return None
+
     def maybe_fail(self, elapsed_s: float) -> None:
+        iteration, stage = self._thread_iteration_and_stage()
+        if self.failure_mode == "iteration":
+            scheduled = self._scheduled_failure(iteration)
+            if scheduled is None:
+                return
+            failure_type, target_rank = scheduled
+            raise SimulatedFailure(
+                failure_type,
+                (
+                    f"scheduled {failure_type} failure at iter={iteration}, "
+                    f"stage={stage}, rank={target_rank}"
+                ),
+                iteration=iteration,
+                stage=stage,
+            )
+
         process_probability = self._failure_probability(
             self.process_failure_rate, elapsed_s
         )
@@ -377,7 +498,6 @@ class DistributedTraining:
         with self._random_lock:
             draw = self.random.random()
 
-        iteration, stage = self._thread_iteration_and_stage()
         if draw < node_only_or_both:
             raise SimulatedFailure(
                 "node",
@@ -459,6 +579,7 @@ class DistributedTraining:
                     "experiment": self.experiment,
                     "variant": self.variant,
                     "attempt": self.attempt,
+                    "run_id": self.object_store_run_id,
                     "rank": self.rank,
                 },
             )
@@ -538,6 +659,7 @@ class DistributedTraining:
                     "checkpoint_gpu_to_dram_s": 0.0,
                     "checkpoint_network_s": 0.0,
                     "checkpoint_object_persist_s": 0.0,
+                    "checkpoint_commit_wait_s": 0.0,
                     "checkpoint_total_s": 0.0,
                     "iteration_s": 0.0,
                     "gradient_bytes_sent": 0,
@@ -551,6 +673,9 @@ class DistributedTraining:
         with self._metrics_lock:
             record["_start"] = time.perf_counter()
         self.log(iteration, "ITERATION", "START", f"target={target_iterations}")
+        # Deterministic mode fires at a stable iteration boundary even when a
+        # configured compute duration is zero.
+        self.maybe_fail(0.0)
 
     def end_iteration(self, iteration: int, target_iterations: int) -> None:
         record = self._record(iteration)
@@ -1241,13 +1366,86 @@ class DistributedTraining:
     # External object-store checkpoint
     # ------------------------------------------------------------------
 
+    @property
+    def checkpoint_parallel_slowdown_multiplier(self) -> float:
+        extra_ranks = max(0, self.world_size - 1)
+        return 1.0 + (
+            extra_ranks
+            * self.checkpoint_slowdown_percent_per_extra_rank
+            / 100.0
+        )
+
+    def _wait_for_checkpoint_commit(
+        self,
+        iteration: int,
+        checkpoint_id: str,
+        already_committed: bool,
+    ) -> float:
+        self.set_stage(iteration, "checkpoint/global-commit-barrier")
+        wait_start = time.perf_counter()
+        self.log(
+            iteration,
+            "CHECKPOINT/BARRIER",
+            "START",
+            f"checkpoint_id={checkpoint_id}, waiting_for_ranks={self.world_size}",
+        )
+
+        deadline = time.monotonic() + self.collective_timeout_s
+        while not already_committed:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for global checkpoint {checkpoint_id}"
+                )
+
+            connection = self._connect(
+                self.object_store_ip,
+                self.object_store_port,
+            )
+            with connection:
+                send_json(
+                    connection,
+                    {
+                        "op": "STATUS",
+                        "experiment": self.experiment,
+                        "variant": self.variant,
+                        "attempt": self.attempt,
+                        "run_id": self.object_store_run_id,
+                    },
+                )
+                status = receive_json(connection)
+
+            manifest = status.get("manifest")
+            already_committed = bool(
+                status.get("status") == "OK"
+                and isinstance(manifest, dict)
+                and manifest.get("checkpoint_id") == checkpoint_id
+                and int(manifest.get("iteration", -1)) == iteration
+                and len(manifest.get("ranks", [])) == self.world_size
+            )
+            if not already_committed:
+                self.failure_aware_sleep(0.05, check_interval_s=0.05)
+
+        wait_s = time.perf_counter() - wait_start
+        self.log(
+            iteration,
+            "CHECKPOINT/BARRIER",
+            "END",
+            f"checkpoint_id={checkpoint_id}, wait_s={wait_s:.3f}",
+        )
+        return wait_s
+
     def checkpoint_to_object_store(self, iteration: int) -> None:
         if self.checkpoint_size_mb > self.dram_capacity_mb:
             raise RuntimeError("Checkpoint exceeds DRAM staging capacity")
 
         record = self._record(iteration)
         checkpoint_start = time.perf_counter()
-        gpu_to_dram_s = self.checkpoint_size_mb / self.gpu_to_dram_bandwidth_mb_s
+        checkpoint_id = f"attempt-{self.attempt}-iteration-{iteration}"
+        base_gpu_to_dram_s = (
+            self.checkpoint_size_mb / self.gpu_to_dram_bandwidth_mb_s
+        )
+        slowdown = self.checkpoint_parallel_slowdown_multiplier
+        gpu_to_dram_s = base_gpu_to_dram_s * slowdown
 
         self.set_stage(iteration, "checkpoint/gpu-to-dram")
         self.log(
@@ -1257,6 +1455,7 @@ class DistributedTraining:
             (
                 f"logical_mb={self.checkpoint_size_mb:.2f}, "
                 f"bandwidth_mb_s={self.gpu_to_dram_bandwidth_mb_s:.2f}, "
+                f"parallel_slowdown={slowdown:.3f}x, "
                 f"expected_s={gpu_to_dram_s:.3f}"
             ),
         )
@@ -1278,10 +1477,13 @@ class DistributedTraining:
                     "experiment": self.experiment,
                     "variant": self.variant,
                     "attempt": self.attempt,
+                    "run_id": self.object_store_run_id,
+                    "checkpoint_id": checkpoint_id,
                     "iteration": iteration,
                     "logical_bytes": self.checkpoint_logical_bytes,
                     "wire_bytes": self.checkpoint_wire_bytes,
                     "rank": self.rank,
+                    "world_size": self.world_size,
                 },
             )
             self.log(
@@ -1308,11 +1510,29 @@ class DistributedTraining:
             if response.get("status") != "OK":
                 raise RuntimeError(f"Object-store PUT failed: {response}")
 
-        total_duration = time.perf_counter() - checkpoint_start
         object_persist_s = float(response.get("object_persist_s", 0.0))
+        self.log(
+            iteration,
+            "CHECKPOINT/OBJECT",
+            "COMMIT",
+            (
+                f"object_persist_s={object_persist_s:.3f}, "
+                f"concurrent_writers={int(response.get('concurrent_writers', 1))}, "
+                f"contention_slowdown="
+                f"{float(response.get('contention_slowdown_multiplier', 1.0)):.3f}x, "
+                f"globally_committed={bool(response.get('committed', False))}"
+            ),
+        )
+        commit_wait_s = self._wait_for_checkpoint_commit(
+            iteration=iteration,
+            checkpoint_id=checkpoint_id,
+            already_committed=bool(response.get("committed", False)),
+        )
+        total_duration = time.perf_counter() - checkpoint_start
         with self._metrics_lock:
             record["checkpoint_network_s"] = network_duration
             record["checkpoint_object_persist_s"] = object_persist_s
+            record["checkpoint_commit_wait_s"] = commit_wait_s
             record["checkpoint_total_s"] = total_duration
 
             self.counters["checkpoint_count"] = int(self.counters["checkpoint_count"]) + 1
@@ -1325,11 +1545,12 @@ class DistributedTraining:
 
         self.log(
             iteration,
-            "CHECKPOINT/OBJECT",
-            "COMMIT",
+            "CHECKPOINT",
+            "END",
             (
                 f"total_s={total_duration:.3f}, network_s={network_duration:.3f}, "
-                f"object_persist_s={object_persist_s:.3f}"
+                f"object_persist_s={object_persist_s:.3f}, "
+                f"commit_wait_s={commit_wait_s:.3f}"
             ),
         )
 
@@ -1605,10 +1826,26 @@ class DistributedTraining:
                 "checkpoint_size_mb": self.checkpoint_size_mb,
                 "checkpoint_wire_scale": self.checkpoint_wire_scale,
                 "checkpoint_wire_mb": self.checkpoint_wire_bytes / 1024 / 1024,
+                "checkpoint_slowdown_percent_per_extra_rank": (
+                    self.checkpoint_slowdown_percent_per_extra_rank
+                ),
                 "network_bandwidth_mbps": self.network_bandwidth_mbps,
                 "network_bandwidth_enforced_by": "mininet",
+                "failure_mode": self.failure_mode,
                 "process_failure_percent_per_second": self.process_failure_rate * 100,
                 "node_failure_percent_per_second": self.node_failure_rate * 100,
+                "process_failure_every_n_iterations": (
+                    self.process_failure_every_n_iterations
+                ),
+                "node_failure_every_n_iterations": (
+                    self.node_failure_every_n_iterations
+                ),
+                "deterministic_process_failure_rank": (
+                    self.deterministic_process_failure_rank
+                ),
+                "deterministic_node_failure_rank": (
+                    self.deterministic_node_failure_rank
+                ),
             },
             "counters": counters,
             "iterations": iterations,

@@ -43,6 +43,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint-wire-scale", type=float, required=True)
     parser.add_argument("--dram-capacity-mb", type=float, required=True)
     parser.add_argument("--gpu-to-dram-bandwidth-mb-s", type=float, required=True)
+    parser.add_argument(
+        "--checkpoint-slowdown-percent-per-extra-rank",
+        type=float,
+        required=True,
+    )
 
     # Kept for the local SSD path, even though the current checkpoint worker
     # sends checkpoints to the external object-store host.
@@ -54,6 +59,31 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--node-failure-percent-per-second", type=float, required=True
+    )
+    parser.add_argument(
+        "--failure-mode",
+        choices=("chance", "probabilistic", "iteration"),
+        required=True,
+    )
+    parser.add_argument(
+        "--process-failure-every-n-iterations",
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        "--node-failure-every-n-iterations",
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        "--deterministic-process-failure-rank",
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        "--deterministic-node-failure-rank",
+        type=int,
+        required=True,
     )
     parser.add_argument("--random-seed", type=int, required=True)
 
@@ -92,10 +122,26 @@ def build_training(args: argparse.Namespace) -> DistributedTraining:
         gpu_to_dram_bandwidth_mb_s=args.gpu_to_dram_bandwidth_mb_s,
         ssd_capacity_mb=args.ssd_capacity_mb,
         ssd_bandwidth_mb_s=args.ssd_bandwidth_mb_s,
+        checkpoint_slowdown_percent_per_extra_rank=(
+            args.checkpoint_slowdown_percent_per_extra_rank
+        ),
+        failure_mode=args.failure_mode,
         process_failure_percent_per_second=(
             args.process_failure_percent_per_second
         ),
         node_failure_percent_per_second=args.node_failure_percent_per_second,
+        process_failure_every_n_iterations=(
+            args.process_failure_every_n_iterations
+        ),
+        node_failure_every_n_iterations=(
+            args.node_failure_every_n_iterations
+        ),
+        deterministic_process_failure_rank=(
+            args.deterministic_process_failure_rank
+        ),
+        deterministic_node_failure_rank=(
+            args.deterministic_node_failure_rank
+        ),
         random_seed=args.random_seed,
         failure_event_file=args.failure_event_file,
         timeline_event_file=args.timeline_event_file,

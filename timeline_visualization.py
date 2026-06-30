@@ -83,6 +83,14 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
         "starts": {"START"},
         "ends": {"COMMIT"},
     },
+    "CHECKPOINT/BARRIER": {
+        "resource": "Object Store",
+        "label": "Global checkpoint barrier",
+        "short": "Wait",
+        "color": "#78716c",
+        "starts": {"START"},
+        "ends": {"END"},
+    },
     "CHECKPOINT/DRAM": {
         "resource": "DRAM",
         "label": "Local DRAM checkpoint",
@@ -395,8 +403,9 @@ def _dashboard_html(data: dict[str, Any]) -> str:
   <div class="guide">
     Normal iteration flow is <code>Forward → Backward + Gradient sync → Update</code>.
     The Network lane makes communication overlap visible. Checkpointing continues as
-    <code>GPU → DRAM → Network → Object Store</code>. SSD appears only when a local-SSD
-    worker path is used. Interrupted blocks and restart time remain visible for failed attempts.
+    <code>GPU → DRAM → Network → Object Store → Global barrier</code>. Parallel slowdown
+    and writer contention are shown in each block's hover details. SSD appears only when a
+    local-SSD worker path is used. Interrupted blocks and restart time remain visible for failed attempts.
   </div>
 </main>
 <script>
