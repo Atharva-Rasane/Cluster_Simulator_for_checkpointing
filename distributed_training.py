@@ -96,6 +96,8 @@ class DistributedTraining:
         node_failure_percent_per_second: float,
         random_seed: int,
         failure_event_file: Path,
+        timeline_event_file: Path,
+        verbose_console_log: bool = False,
         gradient_bucket_cap_mb: float = DEFAULT_GRADIENT_BUCKET_CAP_MB,
         overlap_gradient_sync: bool = True,
         collective_timeout_s: float = DEFAULT_COLLECTIVE_TIMEOUT_S,
@@ -135,6 +137,8 @@ class DistributedTraining:
         self.node_failure_rate = node_failure_percent_per_second / 100.0
         self.random = random.Random(random_seed + attempt * 1_000_003 + rank * 10_007)
         self.failure_event_file = failure_event_file
+        self.timeline_event_file = timeline_event_file
+        self.verbose_console_log = verbose_console_log
 
         self.collective_timeout_s = collective_timeout_s
         self.ring_port = (
@@ -169,6 +173,12 @@ class DistributedTraining:
         self._random_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._stage_local = threading.local()
+        self.timeline_event_file.parent.mkdir(parents=True, exist_ok=True)
+        self._timeline_stream = self.timeline_event_file.open(
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
 
         self._collective_init_lock = threading.RLock()
         self._collective_initialized = False
@@ -256,8 +266,10 @@ class DistributedTraining:
         event: str,
         message: str = "",
     ) -> None:
-        wall_time = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-        elapsed = time.perf_counter() - self.worker_start_time
+        now = datetime.now(timezone.utc)
+        monotonic_s = time.perf_counter()
+        wall_time = now.strftime("%H:%M:%S.%f")[:-3]
+        elapsed = monotonic_s - self.worker_start_time
         iteration_text = "--" if iteration is None else f"{iteration:02d}"
         line = (
             f"{wall_time} UTC | +{elapsed:09.3f}s | "
@@ -267,8 +279,30 @@ class DistributedTraining:
         )
         if message:
             line += f" | {message}"
+
+        marker = {
+            "type": "timeline_marker",
+            "experiment": self.experiment,
+            "variant": self.variant,
+            "attempt": self.attempt,
+            "host": self.name,
+            "rank": self.rank,
+            "iteration": iteration,
+            "component": component,
+            "event": event,
+            "message": message,
+            "monotonic_s": monotonic_s,
+            "worker_elapsed_s": elapsed,
+            "wall_time_utc": now.isoformat(),
+            "thread": threading.current_thread().name,
+        }
+
         with self._log_lock:
-            print(line, flush=True)
+            self._timeline_stream.write(
+                json.dumps(marker, separators=(",", ":")) + "\n"
+            )
+            if self.verbose_console_log:
+                print(line, flush=True)
 
     def log_configuration(
         self,
@@ -1264,6 +1298,12 @@ class DistributedTraining:
             self.log(iteration, "CHECKPOINT/NETWORK", "SENT", f"duration_s={network_duration:.3f}")
 
             self.set_stage(iteration, "checkpoint/object-persist")
+            self.log(
+                iteration,
+                "CHECKPOINT/OBJECT",
+                "START",
+                "waiting for external object-store persistence",
+            )
             response = receive_json(connection)
             if response.get("status") != "OK":
                 raise RuntimeError(f"Object-store PUT failed: {response}")
@@ -1591,6 +1631,10 @@ class DistributedTraining:
         if self._collective_executor is not None:
             self._collective_executor.shutdown(wait=True, cancel_futures=True)
             self._collective_executor = None
+
+        with self._log_lock:
+            if not self._timeline_stream.closed:
+                self._timeline_stream.close()
 
     def __enter__(self) -> DistributedTraining:
         return self

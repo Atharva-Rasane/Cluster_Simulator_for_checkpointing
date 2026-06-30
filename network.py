@@ -6,7 +6,9 @@ import csv
 import json
 import shutil
 import statistics
+import subprocess
 import time
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ from mininet.net import Mininet
 from mininet.node import OVSBridge
 
 from distributed_training import NODE_FAILURE_EXIT_CODE, PROCESS_FAILURE_EXIT_CODE
+from timeline_visualization import write_timeline_dashboard
 
 
 # =====================================================================
@@ -103,6 +106,7 @@ MAX_RECOVERY_ATTEMPTS = 25
 RANDOM_SEED = 20260629
 
 RESULTS_DIRECTORY_NAME = "results"
+AUTO_OPEN_TIMELINE = True
 
 
 # =====================================================================
@@ -197,6 +201,7 @@ def create_worker_command(
     host_configuration: dict[str, Any],
     result_file: Path,
     failure_event_file: Path,
+    timeline_event_file: Path,
 ) -> list[str]:
     return [
         "python3",
@@ -212,6 +217,8 @@ def create_worker_command(
         str(result_file),
         "--failure-event-file",
         str(failure_event_file),
+        "--timeline-event-file",
+        str(timeline_event_file),
         "--name",
         str(host_configuration["name"]),
         "--rank",
@@ -342,6 +349,7 @@ def recover_after_failure(
     net: Mininet,
     failure: dict[str, Any],
     supervisor_event_file: Path,
+    attempt: int,
 ) -> float:
     failure_type = str(failure.get("failure_type", "process"))
     failed_host = str(failure.get("host", ""))
@@ -372,17 +380,21 @@ def recover_after_failure(
         except Exception as error:  # noqa: BLE001
             print(f"*** Warning: could not bring {failed_host} link up: {error}")
 
-    actual_delay = time.perf_counter() - recovery_start
+    recovery_end = time.perf_counter()
+    actual_delay = recovery_end - recovery_start
     append_supervisor_event(
         supervisor_event_file,
         {
             "type": "supervisor_restart",
+            "attempt": attempt,
             "failure_type": failure_type,
             "failed_host": failure.get("host"),
             "failed_rank": failure.get("rank"),
             "failure_iteration": failure.get("iteration"),
             "failure_stage": failure.get("stage"),
             "restart_delay_s": actual_delay,
+            "restart_start_monotonic_s": recovery_start,
+            "restart_end_monotonic_s": recovery_end,
             "wall_time_utc": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -425,7 +437,11 @@ def run_worker_variant(
         attempt_directory = variant_directory / f"attempt-{attempt:02d}"
         attempt_directory.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n*** Launching attempt {attempt} for {variant}\n", flush=True)
+        print(
+            f"\n*** Launching attempt {attempt} for {variant} "
+            f"({len(host_configurations)} workers; detailed logs are in the attempt directory)\n",
+            flush=True,
+        )
         processes: list[tuple[dict[str, Any], Any]] = []
 
         for configuration in host_configurations:
@@ -433,6 +449,9 @@ def run_worker_variant(
             result_file = attempt_directory / f"rank-{configuration['rank']}-result.json"
             failure_event_file = (
                 attempt_directory / f"rank-{configuration['rank']}-failure.json"
+            )
+            timeline_event_file = (
+                attempt_directory / f"rank-{configuration['rank']}-timeline.jsonl"
             )
             command = create_worker_command(
                 worker_script=worker_script,
@@ -442,13 +461,17 @@ def run_worker_variant(
                 host_configuration=configuration,
                 result_file=result_file,
                 failure_event_file=failure_event_file,
+                timeline_event_file=timeline_event_file,
             )
-            print(
-                f"*** Starting {configuration['name']}: rank={configuration['rank']}, "
-                f"ip={configuration['ip']}, attempt={attempt}",
-                flush=True,
+            worker_log_file = (
+                attempt_directory / f"rank-{configuration['rank']}-worker.log"
             )
-            process = host.popen(command, stdout=None, stderr=None)
+            with worker_log_file.open("wb") as worker_log:
+                process = host.popen(
+                    command,
+                    stdout=worker_log,
+                    stderr=subprocess.STDOUT,
+                )
             processes.append((configuration, process))
 
         completed, failure = monitor_attempt(processes, attempt_directory)
@@ -473,6 +496,7 @@ def run_worker_variant(
             net=net,
             failure=failure,
             supervisor_event_file=supervisor_event_file,
+            attempt=attempt,
         )
     else:
         raise RuntimeError(
@@ -771,27 +795,29 @@ def main() -> None:
         event_file = results_root / "object-store-events.jsonl"
         ready_file.unlink(missing_ok=True)
 
-        object_store_process = object_store_host.popen(
-            [
-                "python3",
-                "-u",
-                str(object_store_script),
-                "--host",
-                OBJECT_STORE_IP,
-                "--port",
-                str(OBJECT_STORE_PORT),
-                "--write-bandwidth-mb-s",
-                str(OBJECT_STORE_WRITE_BANDWIDTH_MB_S),
-                "--read-bandwidth-mb-s",
-                str(OBJECT_STORE_READ_BANDWIDTH_MB_S),
-                "--event-file",
-                str(event_file),
-                "--ready-file",
-                str(ready_file),
-            ],
-            stdout=None,
-            stderr=None,
-        )
+        object_store_log_file = results_root / "object-store.log"
+        with object_store_log_file.open("wb") as object_store_log:
+            object_store_process = object_store_host.popen(
+                [
+                    "python3",
+                    "-u",
+                    str(object_store_script),
+                    "--host",
+                    OBJECT_STORE_IP,
+                    "--port",
+                    str(OBJECT_STORE_PORT),
+                    "--write-bandwidth-mb-s",
+                    str(OBJECT_STORE_WRITE_BANDWIDTH_MB_S),
+                    "--read-bandwidth-mb-s",
+                    str(OBJECT_STORE_READ_BANDWIDTH_MB_S),
+                    "--event-file",
+                    str(event_file),
+                    "--ready-file",
+                    str(ready_file),
+                ],
+                stdout=object_store_log,
+                stderr=subprocess.STDOUT,
+            )
 
         ready_deadline = time.monotonic() + 10.0
         while not ready_file.exists():
@@ -815,7 +841,19 @@ def main() -> None:
 
         write_combined_summary(results_root, summaries)
         print_result_tables(summaries)
-        print(f"\nResults written to: {results_root}\n", flush=True)
+        timeline_path = write_timeline_dashboard(results_root, summaries)
+        print(f"\nResults written to: {results_root}", flush=True)
+        print(f"Interactive timeline: {timeline_path}\n", flush=True)
+        if AUTO_OPEN_TIMELINE:
+            try:
+                opened = webbrowser.open_new_tab(timeline_path.resolve().as_uri())
+                if not opened:
+                    print(
+                        "*** No graphical browser was available; open the timeline path manually.",
+                        flush=True,
+                    )
+            except Exception as error:  # noqa: BLE001
+                print(f"*** Could not open timeline automatically: {error}", flush=True)
 
     finally:
         if object_store_process is not None and object_store_process.poll() is None:

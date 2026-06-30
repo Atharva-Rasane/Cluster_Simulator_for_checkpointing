@@ -15,6 +15,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--attempt", type=int, required=True)
     parser.add_argument("--result-file", type=Path, required=True)
     parser.add_argument("--failure-event-file", type=Path, required=True)
+    parser.add_argument("--timeline-event-file", type=Path, required=True)
+    parser.add_argument(
+        "--verbose-console-log",
+        action="store_true",
+        help="Also print every structured worker event as text.",
+    )
 
     parser.add_argument("--name", required=True)
     parser.add_argument("--rank", type=int, required=True)
@@ -92,6 +98,8 @@ def build_training(args: argparse.Namespace) -> DistributedTraining:
         node_failure_percent_per_second=args.node_failure_percent_per_second,
         random_seed=args.random_seed,
         failure_event_file=args.failure_event_file,
+        timeline_event_file=args.timeline_event_file,
+        verbose_console_log=args.verbose_console_log,
     )
 
 
@@ -101,3 +109,5 @@ def run_worker(worker: object, training: DistributedTraining) -> None:
     except SimulatedFailure as failure:
         training.write_failure_event(failure)
         sys.exit(failure.exit_code)
+    finally:
+        training.close()
