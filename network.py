@@ -28,7 +28,7 @@ from timeline_visualization import write_timeline_dashboard
 
 # Every worker is reachable from every other worker through the shared switch.
 NUMBER_OF_NODES = 4
-TARGET_ITERATIONS = 1
+TARGET_ITERATIONS = 5
 
 WORKER_VARIANTS_TO_RUN = [
     "nocheckpointing",
