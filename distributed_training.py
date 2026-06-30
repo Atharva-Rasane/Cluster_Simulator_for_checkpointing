@@ -98,8 +98,6 @@ class DistributedTraining:
         node_failure_percent_per_second: float,
         process_failure_every_n_iterations: int,
         node_failure_every_n_iterations: int,
-        deterministic_process_failure_rank: int,
-        deterministic_node_failure_rank: int,
         random_seed: int,
         failure_event_file: Path,
         timeline_event_file: Path,
@@ -149,10 +147,7 @@ class DistributedTraining:
             process_failure_every_n_iterations
         )
         self.node_failure_every_n_iterations = node_failure_every_n_iterations
-        self.deterministic_process_failure_rank = (
-            deterministic_process_failure_rank
-        )
-        self.deterministic_node_failure_rank = deterministic_node_failure_rank
+        self.random_seed = random_seed
         self.random = random.Random(random_seed + attempt * 1_000_003 + rank * 10_007)
         self.failure_event_file = failure_event_file
         self.timeline_event_file = timeline_event_file
@@ -262,17 +257,6 @@ class DistributedTraining:
         }.items():
             if value < 0:
                 raise ValueError(f"{key} cannot be negative")
-        for key, value in {
-            "deterministic_process_failure_rank": (
-                self.deterministic_process_failure_rank
-            ),
-            "deterministic_node_failure_rank": (
-                self.deterministic_node_failure_rank
-            ),
-        }.items():
-            if not 0 <= value < self.world_size:
-                raise ValueError(f"{key} must identify an existing rank")
-
         positive = {
             "network_bandwidth_mbps": self.network_bandwidth_mbps,
             "gradient_size_mb": self.gradient_size_mb,
@@ -429,43 +413,49 @@ class DistributedTraining:
         """
         Return the deterministic failure due on this attempt.
 
-        The global schedule is ordered by iteration (node before process when
-        both are due). Attempt numbers consume schedule entries, which prevents
-        the same iteration from failing forever after a restart.
+        Each scheduled iteration selects exactly one rank from the shared
+        random seed. Node failure takes precedence if both schedules coincide.
+        Attempt numbers consume schedule entries, preventing the same
+        iteration from failing forever after a restart.
         """
         if iteration < 1:
             return None
 
         ordinal = 0
         for scheduled_iteration in range(1, iteration + 1):
-            scheduled: list[tuple[str, int]] = []
+            failure_type: str | None = None
             if (
                 self.node_failure_every_n_iterations > 0
                 and scheduled_iteration
                 % self.node_failure_every_n_iterations
                 == 0
             ):
-                scheduled.append(
-                    ("node", self.deterministic_node_failure_rank)
-                )
-            if (
+                failure_type = "node"
+            elif (
                 self.process_failure_every_n_iterations > 0
                 and scheduled_iteration
                 % self.process_failure_every_n_iterations
                 == 0
             ):
-                scheduled.append(
-                    ("process", self.deterministic_process_failure_rank)
-                )
+                failure_type = "process"
 
-            for failure_type, target_rank in scheduled:
-                if (
-                    scheduled_iteration == iteration
-                    and self.attempt == ordinal
-                    and self.rank == target_rank
-                ):
-                    return failure_type, target_rank
-                ordinal += 1
+            if failure_type is None:
+                continue
+
+            failure_salt = 97 if failure_type == "node" else 53
+            target_rank = random.Random(
+                self.random_seed
+                + scheduled_iteration * 1_000_003
+                + failure_salt
+            ).randrange(self.world_size)
+
+            if (
+                scheduled_iteration == iteration
+                and self.attempt == ordinal
+                and self.rank == target_rank
+            ):
+                return failure_type, target_rank
+            ordinal += 1
         return None
 
     def maybe_fail(self, elapsed_s: float) -> None:
@@ -1839,12 +1829,6 @@ class DistributedTraining:
                 ),
                 "node_failure_every_n_iterations": (
                     self.node_failure_every_n_iterations
-                ),
-                "deterministic_process_failure_rank": (
-                    self.deterministic_process_failure_rank
-                ),
-                "deterministic_node_failure_rank": (
-                    self.deterministic_node_failure_rank
                 ),
             },
             "counters": counters,

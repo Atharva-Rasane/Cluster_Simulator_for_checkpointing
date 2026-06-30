@@ -111,8 +111,6 @@ NODE_FAILURE_PERCENT_PER_SECOND = 0.01
 # Set either interval to 0 to disable that deterministic failure type.
 PROCESS_FAILURE_EVERY_N_ITERATIONS = 3
 NODE_FAILURE_EVERY_N_ITERATIONS = 5
-DETERMINISTIC_PROCESS_FAILURE_RANK = 0
-DETERMINISTIC_NODE_FAILURE_RANK = 1
 
 PROCESS_RESTART_TIME_SECONDS = 2.0
 NODE_RESTART_TIME_SECONDS = 15.0
@@ -155,14 +153,6 @@ def validate_configuration() -> None:
     }.items():
         if interval < 0:
             raise ValueError(f"{name} cannot be negative")
-    for name, rank in {
-        "DETERMINISTIC_PROCESS_FAILURE_RANK": (
-            DETERMINISTIC_PROCESS_FAILURE_RANK
-        ),
-        "DETERMINISTIC_NODE_FAILURE_RANK": DETERMINISTIC_NODE_FAILURE_RANK,
-    }.items():
-        if not 0 <= rank < NUMBER_OF_NODES:
-            raise ValueError(f"{name} must identify an existing rank")
     unknown = set(WORKER_VARIANTS_TO_RUN) - set(WORKER_SCRIPTS)
     if unknown:
         raise ValueError(f"Unknown worker variants: {sorted(unknown)}")
@@ -214,13 +204,11 @@ def print_configuration_summary() -> None:
     else:
         print(
             "Process failure schedule:           every "
-            f"{PROCESS_FAILURE_EVERY_N_ITERATIONS} iteration(s), "
-            f"rank {DETERMINISTIC_PROCESS_FAILURE_RANK}"
+            f"{PROCESS_FAILURE_EVERY_N_ITERATIONS} iteration(s), random rank"
         )
         print(
             "Node failure schedule:              every "
-            f"{NODE_FAILURE_EVERY_N_ITERATIONS} iteration(s), "
-            f"rank {DETERMINISTIC_NODE_FAILURE_RANK}"
+            f"{NODE_FAILURE_EVERY_N_ITERATIONS} iteration(s), random rank"
         )
     print(f"Process restart delay:              {PROCESS_RESTART_TIME_SECONDS:.3f}s")
     print(f"Node restart delay:                 {NODE_RESTART_TIME_SECONDS:.3f}s")
@@ -328,10 +316,6 @@ def create_worker_command(
         str(PROCESS_FAILURE_EVERY_N_ITERATIONS),
         "--node-failure-every-n-iterations",
         str(NODE_FAILURE_EVERY_N_ITERATIONS),
-        "--deterministic-process-failure-rank",
-        str(DETERMINISTIC_PROCESS_FAILURE_RANK),
-        "--deterministic-node-failure-rank",
-        str(DETERMINISTIC_NODE_FAILURE_RANK),
         "--random-seed",
         str(RANDOM_SEED),
     ]

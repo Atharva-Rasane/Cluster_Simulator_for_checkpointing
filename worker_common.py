@@ -75,16 +75,6 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         required=True,
     )
-    parser.add_argument(
-        "--deterministic-process-failure-rank",
-        type=int,
-        required=True,
-    )
-    parser.add_argument(
-        "--deterministic-node-failure-rank",
-        type=int,
-        required=True,
-    )
     parser.add_argument("--random-seed", type=int, required=True)
 
 
@@ -135,12 +125,6 @@ def build_training(args: argparse.Namespace) -> DistributedTraining:
         ),
         node_failure_every_n_iterations=(
             args.node_failure_every_n_iterations
-        ),
-        deterministic_process_failure_rank=(
-            args.deterministic_process_failure_rank
-        ),
-        deterministic_node_failure_rank=(
-            args.deterministic_node_failure_rank
         ),
         random_seed=args.random_seed,
         failure_event_file=args.failure_event_file,
